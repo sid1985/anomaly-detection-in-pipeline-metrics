@@ -1,0 +1,156 @@
+name: "3 - Scheduled Metrics Collection"
+
+# ── Triggers ──────────────────────────────────────────────────────────────────
+# Daily at 06:00 UTC so results are ready each morning.
+# Also manually triggerable for ad-hoc collection.
+on:
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      aca_url:
+        description: "Override ACA URL (uses secrets.ACA_URL if empty)"
+        required: false
+      runs_comment:
+        description: "Optional note to tag this run in the artifact"
+        required: false
+
+env:
+  PYTHON_VERSION: "3.11"
+
+# ── Jobs ──────────────────────────────────────────────────────────────────────
+jobs:
+
+  collect-metrics:
+    name: "Daily ACA Metrics Collection"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install minimal dependencies
+        run: pip install numpy
+
+      - name: Resolve ACA URL
+        id: resolve-url
+        run: |
+          URL="${{ github.event.inputs.aca_url }}"
+          if [ -z "$URL" ]; then
+            URL="${{ secrets.ACA_URL }}"
+          fi
+          if [ -z "$URL" ]; then
+            echo "ERROR: Set secrets.ACA_URL or pass the aca_url input."
+            exit 1
+          fi
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+          echo "ACA URL: ${URL}"
+
+      - name: Health check (warm-up for scale-to-zero)
+        run: |
+          URL="${{ steps.resolve-url.outputs.url }}"
+          for i in $(seq 1 16); do
+            HTTP=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+                        --max-time 15 "${URL}/health" || echo "000")
+            if [ "$HTTP" = "200" ]; then
+              echo "ACA healthy (attempt ${i})"
+              exit 0
+            fi
+            echo "  attempt ${i}/16: HTTP ${HTTP} — waiting 15 s ..."
+            sleep 15
+          done
+          echo "ERROR: ACA not healthy after 4 minutes"
+          exit 1
+
+      - name: Run 50-run experiment and collect metrics
+        run: |
+          DATE=$(date -u +"%Y-%m-%d")
+          mkdir -p results
+          python dashboard/run_aca_pipelines.py \
+            --url         "${{ steps.resolve-url.outputs.url }}" \
+            --output-json "results/aca_metrics_${DATE}.json" \
+            --fail-below-f1 0.60
+        # Looser threshold for the scheduled run so a slight drift doesn't
+        # break the workflow — it only fails hard below 0.60.
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          METRIC_RUN_NOTE: ${{ github.event.inputs.runs_comment }}
+
+      - name: Build daily trend report
+        if: always()
+        run: |
+          DATE=$(date -u +"%Y-%m-%d")
+          RESULTS_FILE="results/aca_metrics_${DATE}.json"
+          python3 - <<EOF
+import json, os, sys, pathlib
+
+date_str = "${DATE}"
+path = pathlib.Path("${RESULTS_FILE}")
+if not path.exists():
+    print("No results file found — skipping trend report")
+    sys.exit(0)
+
+with open(path) as f:
+    r = json.load(f)
+
+m   = r.get("metrics", {})
+lat = r.get("latency", {})
+pk  = r.get("per_kind", {})
+note = os.environ.get("METRIC_RUN_NOTE", "")
+
+summary = os.environ.get("GITHUB_STEP_SUMMARY", "")
+with open(summary, "a") as f:
+    f.write(f"## Daily Metrics — {date_str}\n\n")
+    if note:
+        f.write(f"> **Note:** {note}\n\n")
+    f.write(f"**API:** {r.get('api_url', 'n/a')}\n\n")
+
+    f.write("### Performance vs Paper Targets\n\n")
+    f.write("| Metric | Measured | Paper (IF) | Paper (Ensemble) |\n")
+    f.write("|--------|----------|-----------|------------------|\n")
+    row = {
+        "Precision": (m.get("precision", 0), 0.88, 0.94),
+        "Recall":    (m.get("recall",    0), 0.82, 0.92),
+        "F1":        (m.get("f1",        0), 0.85, 0.93),
+        "FPR":       (m.get("fpr",       0), 0.04, None),
+    }
+    for name, (val, paper_if, paper_ens) in row.items():
+        ens_str = f"{paper_ens:.2f}" if paper_ens is not None else "—"
+        ok = "✅" if val >= paper_if * 0.80 else "⚠️"
+        f.write(f"| {name} {ok} | {val:.4f} | {paper_if:.2f} | {ens_str} |\n")
+
+    f.write(f"\n**Avg latency:** {lat.get('avg_ms', 0):.1f} ms\n\n")
+
+    f.write("### Detection Rate by Anomaly Type\n\n")
+    f.write("| Type | Detected/Total | Rate |\n")
+    f.write("|------|---------------|------|\n")
+    for kind, stats in pk.items():
+        if isinstance(stats, dict) and stats.get("total", 0) > 0:
+            rate = stats.get("rate", 0)
+            icon = "✅" if rate >= 0.70 else "⚠️"
+            f.write(f"| {kind} | {stats['detected']}/{stats['total']} | {rate:.0%} {icon} |\n")
+
+    cm = r.get("metrics", {})
+    f.write("\n### Confusion Matrix\n\n")
+    f.write("| | Predicted Anomaly | Predicted Normal |\n")
+    f.write("|--|-------------------|------------------|\n")
+    f.write(f"| **Actual Anomaly** | TP={cm.get('tp',0)} | FN={cm.get('fn',0)} |\n")
+    f.write(f"| **Actual Normal**  | FP={cm.get('fp',0)} | TN={cm.get('tn',0)} |\n")
+
+    passed = r.get("passed", False)
+    f.write(f"\n**Status:** {'✅ Within acceptable range' if passed else '❌ Below threshold — investigate'}\n")
+EOF
+
+      - name: Upload daily metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-metrics-${{ github.run_id }}
+          path: results/aca_metrics_*.json
+          retention-days: 365   # keep a year of daily results
+          if-no-files-found: warn

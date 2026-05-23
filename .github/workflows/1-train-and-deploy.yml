@@ -1,0 +1,245 @@
+name: "1 - Train → Build → Deploy to ACA"
+
+# ── Triggers ──────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "azure/**"
+      - "main.py"
+      - "requirements*.txt"
+      - "Dockerfile"
+      - "infra/**"
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: "LSTM training epochs (fast CI default: 10)"
+        default: "10"
+        required: false
+      skip_integration_test:
+        description: "Skip integration test after deploy"
+        type: boolean
+        default: false
+
+# ── Shared env ────────────────────────────────────────────────────────────────
+env:
+  PYTHON_VERSION: "3.11"
+  IMAGE_NAME: anomaly-api
+
+# ── Jobs ──────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ Job 1 — Train models                                                    │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  train:
+    name: "Train ML Models"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: pytest tests/ -v --tb=short
+
+      - name: Train models
+        run: |
+          EPOCHS="${{ github.event.inputs.epochs || '10' }}"
+          echo "Training with --epochs $EPOCHS --no-plots"
+          python main.py --no-plots --epochs "$EPOCHS"
+        env:
+          TF_CPP_MIN_LOG_LEVEL: "3"
+
+      - name: Show model artefacts
+        run: |
+          echo "=== results/ artefacts ==="
+          find results/ -type f | sort
+          echo ""
+          echo "=== model_results.json ==="
+          cat results/model_results.json | python3 -m json.tool 2>/dev/null || cat results/model_results.json
+
+      - name: Upload trained models
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-models-${{ github.sha }}
+          # results/ is .gitignored; this artifact bridges train → build jobs
+          path: |
+            results/isolation_forest.pkl
+            results/scaler.pkl
+            results/lstm_model/
+            results/model_results.json
+          retention-days: 7
+          if-no-files-found: error
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ Job 2 — Build Docker image and push to ACR                              │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  build-and-push:
+    name: "Build & Push to ACR"
+    runs-on: ubuntu-latest
+    needs: train
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download trained models
+        uses: actions/download-artifact@v4
+        with:
+          name: trained-models-${{ github.sha }}
+          path: results/
+
+      - name: Verify model artefacts are present
+        run: |
+          test -f results/isolation_forest.pkl || (echo "isolation_forest.pkl missing" && exit 1)
+          test -f results/scaler.pkl           || (echo "scaler.pkl missing"           && exit 1)
+          test -f results/lstm_model/model.keras || (echo "lstm model missing"         && exit 1)
+          echo "All model artefacts present"
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to Azure Container Registry
+        run: az acr login --name ${{ secrets.ACR_NAME }}
+
+      - name: Build and push Docker image
+        id: build
+        run: |
+          SHORT="${GITHUB_SHA:0:7}"
+          IMAGE="${{ secrets.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${SHORT}"
+          LATEST="${{ secrets.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest"
+
+          docker build --tag "${IMAGE}" --tag "${LATEST}" .
+          docker push "${IMAGE}"
+          docker push "${LATEST}"
+
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Pushed: ${IMAGE}"
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ Job 3 — Deploy to Azure Container Apps via Bicep (incremental)         │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  deploy:
+    name: "Deploy to ACA"
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    outputs:
+      aca-url: ${{ steps.get-url.outputs.url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy / update infrastructure via Bicep
+        run: |
+          az deployment group create \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --template-file  infra/main.bicep \
+            --parameters     acrName="${{ secrets.ACR_NAME }}" \
+                             appName="${{ secrets.ACA_APP_NAME }}" \
+                             containerImage="${{ needs.build-and-push.outputs.image }}" \
+            --mode           Incremental \
+            --output         none
+          echo "Bicep deployment complete"
+
+      - name: Get ACA FQDN
+        id: get-url
+        run: |
+          FQDN=$(az containerapp show \
+            --name           ${{ secrets.ACA_APP_NAME }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --query          'properties.configuration.ingress.fqdn' \
+            --output         tsv)
+          echo "url=https://${FQDN}" >> "$GITHUB_OUTPUT"
+          echo "ACA URL: https://${FQDN}"
+
+      - name: Wait for ACA to pass health check
+        run: |
+          URL="${{ steps.get-url.outputs.url }}"
+          echo "Polling ${URL}/health (up to 5 min) ..."
+          for i in $(seq 1 20); do
+            HTTP=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+                        --max-time 10 "${URL}/health" || echo "000")
+            if [ "$HTTP" = "200" ]; then
+              echo "Healthy after attempt ${i} — ACA is ready"
+              exit 0
+            fi
+            echo "  attempt ${i}/20: HTTP ${HTTP} — waiting 15 s ..."
+            sleep 15
+          done
+          echo "ERROR: ACA did not become healthy within 5 minutes"
+          exit 1
+
+      - name: Write deployment summary
+        if: always()
+        run: |
+          URL="${{ steps.get-url.outputs.url }}"
+          IMAGE="${{ needs.build-and-push.outputs.image }}"
+          echo "## ACA Deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Key | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **URL** | ${URL} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Image** | \`${IMAGE}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Commit** | \`${GITHUB_SHA:0:7}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Branch** | ${{ github.ref_name }} |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ Job 4 — Integration test (50 ACA calls, metrics vs paper)               │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  integration-test:
+    name: "Integration Test (ACA)"
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: ${{ !inputs.skip_integration_test }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install minimal test dependencies
+        run: pip install numpy
+
+      - name: Run ACA integration tests
+        run: |
+          mkdir -p results
+          python dashboard/run_aca_pipelines.py \
+            --url "${{ needs.deploy.outputs.aca-url }}" \
+            --output-json results/aca_test_results.json \
+            --fail-below-f1 0.70
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+
+      - name: Upload integration test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aca-integration-results-${{ github.sha }}
+          path: results/aca_test_results.json
+          retention-days: 90
+          if-no-files-found: warn

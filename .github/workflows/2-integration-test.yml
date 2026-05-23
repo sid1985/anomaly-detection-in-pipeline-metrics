@@ -1,0 +1,143 @@
+name: "2 - Integration Test (ACA)"
+
+# ── Triggers ──────────────────────────────────────────────────────────────────
+# Run automatically after a successful deploy, OR manually with a custom URL.
+on:
+  workflow_run:
+    workflows: ["1 - Train → Build → Deploy to ACA"]
+    types: [completed]
+    branches: [main]
+
+  workflow_dispatch:
+    inputs:
+      aca_url:
+        description: "ACA API base URL (overrides secrets.ACA_URL)"
+        required: false
+      fail_below_f1:
+        description: "Fail if F1 drops below this threshold (default: 0.70)"
+        default: "0.70"
+        required: false
+
+env:
+  PYTHON_VERSION: "3.11"
+
+# ── Jobs ──────────────────────────────────────────────────────────────────────
+jobs:
+
+  integration-test:
+    name: "Run 50-Run ACA Experiment"
+    runs-on: ubuntu-latest
+    # Only run if the triggering deploy workflow succeeded (irrelevant for manual)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install minimal dependencies
+        run: pip install numpy
+
+      - name: Resolve ACA URL
+        id: resolve-url
+        run: |
+          # Priority: manual input > ACA_URL secret
+          URL="${{ github.event.inputs.aca_url }}"
+          if [ -z "$URL" ]; then
+            URL="${{ secrets.ACA_URL }}"
+          fi
+          if [ -z "$URL" ]; then
+            echo "ERROR: ACA URL not provided. Set secrets.ACA_URL or pass aca_url input."
+            exit 1
+          fi
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+          echo "Using ACA URL: ${URL}"
+
+      - name: Health check (with warm-up retry)
+        run: |
+          URL="${{ steps.resolve-url.outputs.url }}"
+          echo "Warming up ACA (scale-from-zero may take ~30 s) ..."
+          for i in $(seq 1 12); do
+            HTTP=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+                        --max-time 15 "${URL}/health" || echo "000")
+            if [ "$HTTP" = "200" ]; then
+              echo "  Healthy after attempt ${i}"
+              exit 0
+            fi
+            echo "  attempt ${i}/12: HTTP ${HTTP} — waiting 15 s ..."
+            sleep 15
+          done
+          echo "ERROR: ACA not healthy"
+          exit 1
+
+      - name: Run integration experiment
+        run: |
+          mkdir -p results
+          THRESHOLD="${{ github.event.inputs.fail_below_f1 || '0.70' }}"
+          python dashboard/run_aca_pipelines.py \
+            --url            "${{ steps.resolve-url.outputs.url }}" \
+            --output-json    results/aca_test_results.json \
+            --fail-below-f1  "${THRESHOLD}"
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aca-integration-results-${{ github.run_id }}
+          path: results/aca_test_results.json
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Show results in job summary
+        if: always()
+        run: |
+          if [ -f results/aca_test_results.json ]; then
+            python3 - <<'EOF'
+import json, os, sys
+path = "results/aca_test_results.json"
+with open(path) as f:
+    r = json.load(f)
+
+m   = r.get("metrics", {})
+lat = r.get("latency", {})
+pk  = r.get("per_kind", {})
+
+summary = os.environ.get("GITHUB_STEP_SUMMARY", "")
+with open(summary, "a") as f:
+    f.write("## Integration Test Results\n\n")
+    f.write(f"**API URL:** {r.get('api_url', 'n/a')}\n\n")
+    f.write("### Model Performance vs Paper (Isolation Forest)\n\n")
+    f.write("| Metric | This Run | Paper Target | Status |\n")
+    f.write("|--------|----------|--------------|--------|\n")
+    targets = {"precision": 0.88, "recall": 0.82, "f1": 0.85}
+    for metric, target in targets.items():
+        val = m.get(metric, 0)
+        ok  = "✅" if val >= target * 0.85 else "⚠️"
+        f.write(f"| {metric.capitalize()} | {val:.4f} | {target:.2f} | {ok} |\n")
+
+    f.write(f"\n**Avg Latency:** {lat.get('avg_ms', 0):.1f} ms"
+            f" | Min: {lat.get('min_ms', 0):.1f} ms"
+            f" | Max: {lat.get('max_ms', 0):.1f} ms\n\n")
+
+    f.write("### Per-Anomaly-Type Detection Rate\n\n")
+    f.write("| Type | Detected | Total | Rate |\n")
+    f.write("|------|----------|-------|------|\n")
+    for kind, stats in pk.items():
+        if isinstance(stats, dict) and stats.get("total", 0) > 0:
+            rate = stats.get("rate", 0)
+            icon = "✅" if rate >= 0.75 else "⚠️"
+            f.write(f"| {kind} | {stats['detected']} | {stats['total']}"
+                    f" | {rate:.0%} {icon} |\n")
+
+    passed = r.get("passed", False)
+    f.write(f"\n**Overall:** {'✅ PASSED' if passed else '❌ FAILED'}\n")
+EOF
+          fi

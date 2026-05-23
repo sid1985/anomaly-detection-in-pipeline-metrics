@@ -1,0 +1,21 @@
+# Slim dependency set for the FastAPI container image.
+# Full training deps (matplotlib, seaborn, jupyter, etc.) are NOT included
+# to keep the Docker image smaller and startup faster.
+
+# ML inference
+scikit-learn==1.4.2
+tensorflow==2.16.1
+numpy==1.26.4
+pandas==2.2.2
+
+# Azure (identity + storage used by api.py)
+azure-storage-blob==12.20.0
+azure-identity==1.16.1
+
+# Utilities
+joblib==1.4.2
+python-dotenv==1.0.1
+
+# API server
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
