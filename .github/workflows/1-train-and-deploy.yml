@@ -228,11 +228,27 @@ jobs:
       - name: Install minimal test dependencies
         run: pip install numpy
 
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get ACA URL
+        id: get-url
+        run: |
+          FQDN=$(az containerapp show \
+            --name           ${{ secrets.ACA_APP_NAME }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --query          'properties.configuration.ingress.fqdn' \
+            --output         tsv)
+          echo "url=https://${FQDN}" >> "$GITHUB_OUTPUT"
+          echo "ACA URL: https://${FQDN}"
+
       - name: Run ACA integration tests
         run: |
           mkdir -p results
           python dashboard/run_aca_pipelines.py \
-            --url "${{ needs.deploy.outputs.aca-url }}" \
+            --url "${{ steps.get-url.outputs.url }}" \
             --output-json results/aca_test_results.json \
             --fail-below-f1 0.70
         env:
