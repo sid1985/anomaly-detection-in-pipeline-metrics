@@ -152,12 +152,15 @@ jobs:
 
       - name: Deploy / update infrastructure via Bicep
         run: |
+          # Use :latest tag — build job always pushes both SHA and latest tags
+          CONTAINER_IMAGE="${{ secrets.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest"
+          echo "Deploying image: ${CONTAINER_IMAGE}"
           az deployment group create \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --template-file  infra/main.bicep \
             --parameters     acrName="${{ secrets.ACR_NAME }}" \
                              appName="${{ secrets.ACA_APP_NAME }}" \
-                             containerImage="${{ needs.build-and-push.outputs.image }}" \
+                             containerImage="${CONTAINER_IMAGE}" \
             --mode           Incremental \
             --output         none
           echo "Bicep deployment complete"
