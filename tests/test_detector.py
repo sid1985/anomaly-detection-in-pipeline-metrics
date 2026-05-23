@@ -57,7 +57,11 @@ class TestDataGenerator:
 
     def test_build_duration_range(self, df):
         assert df["build_duration"].min() >= 200
-        assert df["build_duration"].max() <= 900
+        # Spike anomalies can reach up to 1200s (rng.uniform(850, 1200))
+        assert df["build_duration"].max() <= 1200
+        # Normal (non-anomaly) records should stay within 460s
+        normal_max = df.loc[df["is_anomaly"] == 0, "build_duration"].max()
+        assert normal_max <= 500, f"Normal build_duration too high: {normal_max}"
 
     def test_resource_utilization_clipped(self, df):
         assert df["resource_utilization"].between(0, 100).all()
