@@ -55,14 +55,16 @@ def generate_runs(seed: int = RANDOM_SEED) -> List[PipelineRun]:
     rng = random.Random(seed)
     runs = []
 
-    # 30 normal runs
+    # 30 normal runs — ranges deliberately match the training CSV distribution
+    # (pipeline_metrics.csv normals: build 310-425s, test_exec 180-290s,
+    #  deploy_freq 3.3-4.9/day, resource 52-72%, error_count 0-2)
     for _ in range(30):
         runs.append(PipelineRun(
-            build_duration       = rng.uniform(180, 450),
-            test_execution_time  = rng.uniform(40,  110),
-            deployment_frequency = rng.uniform(2.0, 6.0),
-            resource_utilization = rng.uniform(35,  72),
-            error_count          = rng.randint(0, 1),
+            build_duration       = rng.uniform(310, 425),
+            test_execution_time  = rng.uniform(180, 290),
+            deployment_frequency = rng.uniform(3.0, 5.0),
+            resource_utilization = rng.uniform(50,  72),
+            error_count          = rng.randint(0, 2),
             true_label           = 0,
             anomaly_kind         = "normal",
         ))
@@ -171,6 +173,8 @@ def main():
     parser.add_argument("--fail-below-f1", type=float, default=None,
                         metavar="THRESHOLD",
                         help="Exit with code 1 if F1 < THRESHOLD (for CI gate)")
+    parser.add_argument("--no-push", action="store_true",
+                        help="Skip Pushgateway push (use in CI where Pushgateway is not available)")
     args = parser.parse_args()
     api_url = args.url.rstrip("/")
 
@@ -258,35 +262,38 @@ def main():
     print("=" * 60)
 
     # ── Push to Prometheus Pushgateway ────────────────────────────────────────
-    print("\n[ACA Runner] Pushing ACA metrics to Pushgateway...")
-    push_metric("aca_model_f1_score",       m["f1"],        {"model": "isolation_forest_aca"})
-    push_metric("aca_model_precision",      m["precision"],  {"model": "isolation_forest_aca"})
-    push_metric("aca_model_recall",         m["recall"],     {"model": "isolation_forest_aca"})
-    push_metric("aca_model_fpr",            m["fpr"],        {"model": "isolation_forest_aca"})
-    push_metric("aca_model_latency_ms",     avg_lat,         {"model": "isolation_forest_aca"})
-    push_metric("aca_run_count_total",      len(runs))
-    push_metric("aca_anomaly_detected",     sum(pred_labels))
-    push_metric("aca_anomaly_groundtruth",  sum(true_labels))
-    push_metric("aca_true_positives",       m["tp"])
-    push_metric("aca_false_positives",      m["fp"])
-    push_metric("aca_false_negatives",      m["fn"])
+    if args.no_push:
+        print("\n[ACA Runner] Skipping Pushgateway push (--no-push set)")
+    else:
+        print("\n[ACA Runner] Pushing ACA metrics to Pushgateway...")
+        push_metric("aca_model_f1_score",       m["f1"],        {"model": "isolation_forest_aca"})
+        push_metric("aca_model_precision",      m["precision"],  {"model": "isolation_forest_aca"})
+        push_metric("aca_model_recall",         m["recall"],     {"model": "isolation_forest_aca"})
+        push_metric("aca_model_fpr",            m["fpr"],        {"model": "isolation_forest_aca"})
+        push_metric("aca_model_latency_ms",     avg_lat,         {"model": "isolation_forest_aca"})
+        push_metric("aca_run_count_total",      len(runs))
+        push_metric("aca_anomaly_detected",     sum(pred_labels))
+        push_metric("aca_anomaly_groundtruth",  sum(true_labels))
+        push_metric("aca_true_positives",       m["tp"])
+        push_metric("aca_false_positives",      m["fp"])
+        push_metric("aca_false_negatives",      m["fn"])
 
-    # Push per-kind detection
-    for kind, pairs in per_kind.items():
-        positives = [p for t, p in pairs if t == 1]
-        if positives:
-            push_metric("aca_detection_rate",
-                        sum(positives) / len(positives),
-                        {"anomaly_kind": kind})
+        # Push per-kind detection
+        for kind, pairs in per_kind.items():
+            positives = [p for t, p in pairs if t == 1]
+            if positives:
+                push_metric("aca_detection_rate",
+                            sum(positives) / len(positives),
+                            {"anomaly_kind": kind})
 
-    # Also push synthetic IF for side-by-side panel in Grafana
-    if if_syn:
-        push_metric("aca_model_f1_score",   if_syn["f1"],       {"model": "isolation_forest_synthetic"})
-        push_metric("aca_model_precision",  if_syn["precision"], {"model": "isolation_forest_synthetic"})
-        push_metric("aca_model_recall",     if_syn["recall"],    {"model": "isolation_forest_synthetic"})
+        # Also push synthetic IF for side-by-side panel in Grafana
+        if if_syn:
+            push_metric("aca_model_f1_score",   if_syn["f1"],       {"model": "isolation_forest_synthetic"})
+            push_metric("aca_model_precision",  if_syn["precision"], {"model": "isolation_forest_synthetic"})
+            push_metric("aca_model_recall",     if_syn["recall"],    {"model": "isolation_forest_synthetic"})
 
-    print("[ACA Runner] Done. Check Grafana at http://localhost:3000")
-    print("[ACA Runner] Pushgateway: http://localhost:9091")
+        print("[ACA Runner] Done. Check Grafana at http://localhost:3000")
+        print("[ACA Runner] Pushgateway: http://localhost:9091")
 
     # ── JSON output ───────────────────────────────────────────────────────────
     per_kind_stats: dict = {}

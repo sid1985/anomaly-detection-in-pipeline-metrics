@@ -250,7 +250,8 @@ jobs:
           python dashboard/run_aca_pipelines.py \
             --url "${{ steps.get-url.outputs.url }}" \
             --output-json results/aca_test_results.json \
-            --fail-below-f1 0.70
+            --fail-below-f1 0.70 \
+            --no-push
         env:
           GITHUB_SHA: ${{ github.sha }}
 
