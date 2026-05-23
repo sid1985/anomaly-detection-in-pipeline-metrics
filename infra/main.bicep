@@ -158,22 +158,6 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
-// ── AcrPull role assignment: ACA managed identity → ACR ──────────────────────
-var acrPullRoleId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
-
-resource acrPullAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(acr.id, containerApp.id, acrPullRoleId)
-  scope: acr
-  properties: {
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      acrPullRoleId
-    )
-    principalId: containerApp.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
 // ── Outputs ───────────────────────────────────────────────────────────────────
 output acrLoginServer string = acr.properties.loginServer
 output containerAppFqdn string = containerApp.properties.configuration.ingress.fqdn
